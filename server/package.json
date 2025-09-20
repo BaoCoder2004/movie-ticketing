@@ -1,0 +1,19 @@
+{
+  "name": "movie-ticketing-server",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "server": "nodemon src/index.js",
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^5.0.1",
+    "mysql2": "^3.11.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}
