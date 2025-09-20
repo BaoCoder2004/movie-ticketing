@@ -31,11 +31,7 @@ function toOrderRow(o){
   };
 }
 
-/**
- * GET /api/orders?q=&status=&page=&pageSize=
- * - status: pending|confirmed|expired|canceled
- * - refundable: chỉ true khi đơn đã confirmed và vẫn còn >= REFUND_WINDOW_HOURS trước suất sớm nhất
- */
+/* ===================== LIST ===================== */
 router.get('/orders', async (req, res) => {
   try {
     const q = String(req.query.q || '').trim();
@@ -70,7 +66,7 @@ router.get('/orders', async (req, res) => {
                 WHEN o.status='confirmed' AND (
                   SELECT TIMESTAMPDIFF(HOUR, UTC_TIMESTAMP(), MIN(st.start_at))
                     FROM order_items oi
-                    JOIN tickets t ON t.id = oi.ticket_id
+                    JOIN tickets t    ON t.id = oi.ref_id AND oi.kind='TICKET'
                     JOIN showtimes st ON st.id = t.showtime_id
                    WHERE oi.order_id = o.id
                 ) >= ? THEN 1 ELSE 0
@@ -89,10 +85,7 @@ router.get('/orders', async (req, res) => {
   }
 });
 
-/**
- * GET /api/orders/:id
- * - Trả chi tiết đơn + vé + payments
- */
+/* ===================== DETAIL ===================== */
 router.get('/orders/:id', async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return bad(res, 'BAD_REQUEST', 'id không hợp lệ');
@@ -108,14 +101,13 @@ router.get('/orders/:id', async (req, res) => {
     );
     if (!o) return bad(res, 'NOT_FOUND', 'Order không tồn tại', 404);
 
-    // Vé trong đơn qua order_items → tickets
     const [ticketsRows] = await pool.query(
-      `SELECT t.id AS ticket_id, t.showtime_id, t.seat_id, t.qr_code, t.scanned_at,
+      `SELECT t.id AS ticket_id, t.showtime_id, t.seat_id, t.qr_code, t.scanned_at, t.status AS ticket_status,
               s.row_label, s.col_number,
               st.start_at, st.end_at,
               m.title AS movie_title, r.name AS room_name
          FROM order_items oi
-         JOIN tickets t   ON t.id = oi.ticket_id
+         JOIN tickets t    ON t.id = oi.ref_id AND oi.kind='TICKET'
          JOIN showtimes st ON st.id = t.showtime_id
          JOIN rooms r      ON r.id = st.room_id
          JOIN movies m     ON m.id = st.movie_id
@@ -136,7 +128,7 @@ router.get('/orders/:id', async (req, res) => {
     const [[timing]] = await pool.query(
       `SELECT MIN(st.start_at) AS min_start
          FROM order_items oi
-         JOIN tickets t ON t.id = oi.ticket_id
+         JOIN tickets t    ON t.id = oi.ref_id AND oi.kind='TICKET'
          JOIN showtimes st ON st.id = t.showtime_id
         WHERE oi.order_id=?`,
       [id]
@@ -162,13 +154,15 @@ router.get('/orders/:id', async (req, res) => {
           startAt: t.start_at ? new Date(t.start_at).toISOString() : null,
           endAt: t.end_at ? new Date(t.end_at).toISOString() : null,
           qrCode: t.qr_code || null,
+          status: t.ticket_status || null,
           scannedAt: t.scanned_at ? new Date(t.scanned_at).toISOString() : null
         }))
       },
       payments: payments.map(p => ({
         id: Number(p.id),
         provider: p.provider,
-        status: p.status,                 // 'paid' | 'refunded' | 'failed'
+        // DB values: INITIATED | SUCCESS | FAILED | REFUNDED
+        status: String(p.status || '').toLowerCase(),
         amount: Number(p.amount || 0),
         createdAt: p.created_at ? new Date(p.created_at).toISOString() : null
       })),
@@ -179,10 +173,7 @@ router.get('/orders/:id', async (req, res) => {
   }
 });
 
-/**
- * PATCH /api/orders/:id/cancel
- * - Chỉ huỷ đơn đang pending
- */
+/* ===================== CANCEL ===================== */
 router.patch('/orders/:id/cancel', async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return bad(res, 'BAD_REQUEST', 'id không hợp lệ');
@@ -211,12 +202,7 @@ router.patch('/orders/:id/cancel', async (req, res) => {
   } finally { conn.release(); }
 });
 
-/**
- * POST /api/orders/:id/refund
- * - Chỉ hoàn tiền cho đơn confirmed
- * - Phải còn >= REFUND_WINDOW_HOURS trước suất sớm nhất
- * - Đánh dấu payments.refunded, và chuyển orders.status='canceled'
- */
+/* ===================== REFUND ===================== */
 router.post('/orders/:id/refund', async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return bad(res, 'BAD_REQUEST', 'id không hợp lệ');
@@ -235,7 +221,7 @@ router.post('/orders/:id/refund', async (req, res) => {
     const [[timing]] = await conn.query(
       `SELECT MIN(st.start_at) AS min_start
          FROM order_items oi
-         JOIN tickets t ON t.id = oi.ticket_id
+         JOIN tickets t    ON t.id = oi.ref_id AND oi.kind='TICKET'
          JOIN showtimes st ON st.id = t.showtime_id
         WHERE oi.order_id=?`,
       [id]
@@ -248,13 +234,12 @@ router.post('/orders/:id/refund', async (req, res) => {
       if (!okRow.ok) { await conn.rollback(); return bad(res,'REFUND_WINDOW_EXCEEDED',`Chỉ hoàn tiền trước ${REFUND_WINDOW_HOURS} giờ`,409); }
     }
 
-    // đánh dấu payment đã hoàn
     await conn.query(
-      `UPDATE payments SET status='refunded' WHERE order_id=? AND status='paid'`,
+      `UPDATE payments SET status='REFUNDED', pay_date=UTC_TIMESTAMP()
+        WHERE order_id=? AND status='SUCCESS'`,
       [id]
     );
 
-    // chuyển trạng thái đơn về 'canceled'
     await conn.query(
       `UPDATE orders SET status='canceled', updated_at=UTC_TIMESTAMP() WHERE id=?`,
       [id]
@@ -262,6 +247,155 @@ router.post('/orders/:id/refund', async (req, res) => {
 
     await conn.commit();
     res.json({ id, refunded: true, amount: Number(o.total || 0) });
+  } catch (e) {
+    await conn.rollback();
+    return bad(res, 'INTERNAL', e.message, 500);
+  } finally { conn.release(); }
+});
+
+/* ===================== APPLY VOUCHER ===================== */
+/**
+ * POST /api/orders/:id/apply-voucher
+ * body: { code: string }
+ * Yêu cầu: đơn đang pending. Voucher còn hiệu lực. Tính discount và cập nhật orders(total).
+ * Bảng giả định:
+ *   vouchers(id, code, type ENUM('PERCENT','AMOUNT'), value, max_discount, is_active, start_at, expiry_at, quota, per_user_limit)
+ *   voucher_usages(id, voucher_id, order_id, user_id, amount, created_at)
+ */
+router.post('/orders/:id/apply-voucher', async (req, res) => {
+  const id = Number(req.params.id);
+  const code = String(req.body?.code || '').trim();
+  if (!Number.isInteger(id) || id <= 0 || !code) return bad(res, 'BAD_REQUEST', 'Thiếu id hoặc code');
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [[o]] = await conn.query(
+      `SELECT id,user_id,status,subtotal,discount,total FROM orders WHERE id=? FOR UPDATE`,
+      [id]
+    );
+    if (!o) { await conn.rollback(); return bad(res,'NOT_FOUND','Order không tồn tại',404); }
+    if (o.status !== 'pending') { await conn.rollback(); return bad(res,'INVALID_STATE','Chỉ áp voucher cho đơn pending',409); }
+
+    const [[v]] = await conn.query(
+      `SELECT id, code, type, value, COALESCE(max_discount,0) AS max_discount,
+              is_active, start_at, expiry_at, COALESCE(quota,0) AS quota, COALESCE(per_user_limit,0) AS per_user_limit
+         FROM vouchers
+        WHERE code = ? FOR UPDATE`,
+      [code]
+    );
+    if (!v) { await conn.rollback(); return bad(res,'INVALID_VOUCHER','Mã không tồn tại',404); }
+    if (!v.is_active) { await conn.rollback(); return bad(res,'INVALID_VOUCHER','Mã đã khóa',409); }
+    if (v.start_at && new Date(v.start_at) > new Date()) { await conn.rollback(); return bad(res,'INVALID_VOUCHER','Chưa đến thời gian áp dụng',409); }
+    if (v.expiry_at && new Date(v.expiry_at) < new Date()) { await conn.rollback(); return bad(res,'INVALID_VOUCHER','Mã đã hết hạn',409); }
+
+    // quota tổng và quota theo user
+    const [[{ usedTotal }]] = await conn.query(
+      `SELECT COUNT(*) AS usedTotal FROM voucher_usages WHERE voucher_id=?`,
+      [v.id]
+    );
+    if (v.quota && usedTotal >= v.quota) { await conn.rollback(); return bad(res,'QUOTA_EXCEEDED','Hết lượt sử dụng',409); }
+
+    const [[{ usedByUser }]] = await conn.query(
+      `SELECT COUNT(*) AS usedByUser FROM voucher_usages WHERE voucher_id=? AND user_id=?`,
+      [v.id, o.user_id]
+    );
+    if (v.per_user_limit && usedByUser >= v.per_user_limit) {
+      await conn.rollback(); return bad(res,'USER_LIMIT_EXCEEDED','Bạn đã dùng hết lượt cho mã này',409);
+    }
+
+    // tính giảm
+    const subtotal = Number(o.subtotal || 0);
+    let discount = 0;
+    if (v.type === 'PERCENT') {
+      discount = Math.floor(subtotal * Number(v.value || 0) / 100);
+      if (v.max_discount) discount = Math.min(discount, Number(v.max_discount));
+    } else { // AMOUNT
+      discount = Math.min(subtotal, Number(v.value || 0));
+    }
+    const total = Math.max(0, subtotal - discount);
+
+    await conn.query(
+      `UPDATE orders SET discount=?, total=?, updated_at=UTC_TIMESTAMP() WHERE id=?`,
+      [discount, total, id]
+    );
+
+    await conn.query(
+      `INSERT INTO voucher_usages(voucher_id, order_id, user_id, amount, created_at)
+       VALUES(?,?,?,?,UTC_TIMESTAMP())`,
+      [v.id, id, o.user_id, discount]
+    );
+
+    await conn.commit();
+    res.json({ id, code: v.code, discount, total });
+  } catch (e) {
+    await conn.rollback();
+    return bad(res, 'INTERNAL', e.message, 500);
+  } finally { conn.release(); }
+});
+
+/* ===================== CONFIRM (ISSUE TICKETS) ===================== */
+/**
+ * POST /api/orders/:id/confirm
+ * Điều kiện:
+ *  - đơn pending và chưa hết hạn
+ *  - có ít nhất một payment SUCCESS
+ *  - đã có các ticket gắn vào order qua order_items(kind='TICKET', ref_id=tickets.id)
+ * Hành động:
+ *  - phát QR cho ticket chưa có, set tickets.status='ISSUED'
+ *  - đổi orders.status='confirmed', confirmed_at=UTC_TIMESTAMP()
+ */
+router.post('/orders/:id/confirm', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return bad(res, 'BAD_REQUEST', 'id không hợp lệ');
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [[o]] = await conn.query(
+      `SELECT id,status,expires_at FROM orders WHERE id=? FOR UPDATE`, [id]
+    );
+    if (!o) { await conn.rollback(); return bad(res,'NOT_FOUND','Không tìm thấy order',404); }
+    if (o.status !== 'pending') { await conn.rollback(); return bad(res,'INVALID_STATE','Chỉ confirm đơn pending',409); }
+    if (o.expires_at && new Date(o.expires_at) <= new Date()) {
+      await conn.rollback(); return bad(res,'ORDER_EXPIRED','Đơn đã hết hạn',409);
+    }
+
+    const [[pOk]] = await conn.query(
+      `SELECT COUNT(*) AS ok FROM payments WHERE order_id=? AND status='SUCCESS'`, [id]
+    );
+    if (!pOk.ok) { await conn.rollback(); return bad(res,'NO_SUCCESS_PAYMENT','Chưa có thanh toán thành công',409); }
+
+    // lấy các ticket thuộc order
+    const [tks] = await conn.query(
+      `SELECT t.id, t.qr_code, t.status
+         FROM order_items oi
+         JOIN tickets t ON t.id = oi.ref_id AND oi.kind='TICKET'
+        WHERE oi.order_id=? FOR UPDATE`,
+      [id]
+    );
+    if (!tks.length) { await conn.rollback(); return bad(res,'NO_TICKETS','Đơn chưa có vé',409); }
+
+    // phát QR và set ISSUED cho vé chưa phát
+    for (const t of tks) {
+      if (!t.qr_code || t.status !== 'ISSUED') {
+        const qr = t.qr_code || `QR:${id}:${t.id}:${Date.now()}`;
+        await conn.query(
+          `UPDATE tickets SET qr_code=?, status='ISSUED', updated_at=UTC_TIMESTAMP() WHERE id=?`,
+          [qr, t.id]
+        );
+      }
+    }
+
+    await conn.query(
+      `UPDATE orders SET status='confirmed', confirmed_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP() WHERE id=?`,
+      [id]
+    );
+
+    await conn.commit();
+    res.json({ id, confirmed: true, tickets: tks.length });
   } catch (e) {
     await conn.rollback();
     return bad(res, 'INTERNAL', e.message, 500);

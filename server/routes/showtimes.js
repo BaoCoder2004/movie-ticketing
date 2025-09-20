@@ -19,7 +19,7 @@ function buildWhere({ movieId, roomId, from, to }) {
   if (movieId) { where.push('st.movie_id = ?'); args.push(Number(movieId)); }
   if (roomId)  { where.push('st.room_id  = ?'); args.push(Number(roomId)); }
   if (from)    { where.push('st.start_at >= ?'); args.push(isMySQL(from) ? from : isoToMySQL(from)); }
-  if (to) { // bao phủ hết giây cuối cùng
+  if (to) {
     where.push('st.start_at < DATE_ADD(?, INTERVAL 1 SECOND)');
     args.push(isMySQL(to) ? to : isoToMySQL(to));
   }
@@ -110,7 +110,7 @@ router.get('/showtimes/:id/availability', async (req, res) => {
              CASE WHEN EXISTS (
                SELECT 1
                FROM tickets t
-               JOIN order_items oi ON oi.ticket_id = t.id
+               JOIN order_items oi ON oi.ref_id = t.id AND oi.kind='TICKET'
                JOIN orders o ON o.id = oi.order_id
                WHERE t.showtime_id = ?
                  AND t.seat_id = s.id
